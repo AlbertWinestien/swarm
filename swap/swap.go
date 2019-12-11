@@ -66,6 +66,7 @@ type Swap struct {
 	contract          contract.Contract          // reference to the smart contract
 	chequebookFactory contract.SimpleSwapFactory // the chequebook factory used
 	honeyPriceOracle  HoneyOracle                // oracle which resolves the price of honey (in Wei)
+	cashoutLoop       *CashoutLoop
 }
 
 // Owner encapsulates information related to accessing the contract
@@ -144,6 +145,7 @@ func newSwapInstance(stateStore state.Store, owner *Owner, backend contract.Back
 		chequebookFactory: chequebookFactory,
 		honeyPriceOracle:  NewHoneyPriceOracle(),
 		chainID:           chainID,
+		cashoutLoop:       newCashoutLoop(stateStore, backend, owner.privateKey),
 	}
 }
 
@@ -230,6 +232,8 @@ func New(dbPath string, prvkey *ecdsa.PrivateKey, backendURL string, params *Par
 			swapLog.Info("Skipping deposit")
 		}
 	}
+
+	swap.cashoutLoop.start()
 
 	return swap, nil
 }
@@ -362,8 +366,6 @@ func (s *Swap) handleMsg(p *Peer) func(ctx context.Context, msg interface{}) err
 	}
 }
 
-var defaultCashCheque = cashCheque
-
 // handleEmitChequeMsg should be handled by the creditor when it receives
 // a cheque from a debitor
 func (s *Swap) handleEmitChequeMsg(ctx context.Context, p *Peer, msg *EmitChequeMsg) error {
@@ -408,30 +410,13 @@ func (s *Swap) handleEmitChequeMsg(ctx context.Context, p *Peer, msg *EmitCheque
 		return err
 	}
 
-	otherSwap, err := contract.InstanceAt(cheque.Contract, s.backend)
-	if err != nil {
-		log.Error("error getting contract", "err", err)
-		return err
-	}
+	s.cashoutLoop.queueRequest(&CashoutRequest{
+		Peer:        p.ID(),
+		Cheque:      *cheque,
+		Destination: s.GetParams().ContractAddress,
+	})
 
-	gasPrice, err := s.backend.SuggestGasPrice(context.TODO())
-	if err != nil {
-		return err
-	}
-	transactionCosts := gasPrice.Uint64() * 50000 // cashing a cheque is approximately 50000 gas
-	paidOut, err := otherSwap.PaidOut(nil, cheque.Beneficiary)
-	if err != nil {
-		return err
-	}
-	// do a payout transaction if we get 2 times the gas costs
-	if (cheque.CumulativePayout - paidOut.Uint64()) > 2*transactionCosts {
-		opts := bind.NewKeyedTransactor(s.owner.privateKey)
-		opts.Context = ctx
-		// cash cheque in async, otherwise this blocks here until the TX is mined
-		go defaultCashCheque(s, otherSwap, opts, cheque)
-	}
-
-	return err
+	return nil
 }
 
 func (s *Swap) handleConfirmChequeMsg(ctx context.Context, p *Peer, msg *ConfirmChequeMsg) {
@@ -460,30 +445,6 @@ func (s *Swap) handleConfirmChequeMsg(ctx context.Context, p *Peer, msg *Confirm
 		p.Drop(fmt.Sprintf("persistence error: %v", err))
 		return
 	}
-}
-
-// cashCheque should be called async as it blocks until the transaction(s) are mined
-// The function cashes the cheque by sending it to the blockchain
-func cashCheque(s *Swap, otherSwap contract.Contract, opts *bind.TransactOpts, cheque *Cheque) {
-	// blocks here, as we are waiting for the transaction to be mined
-	result, receipt, err := otherSwap.CashChequeBeneficiary(opts, s.GetParams().ContractAddress, big.NewInt(int64(cheque.CumulativePayout)), cheque.Signature)
-	if err != nil {
-		// TODO: do something with the error
-		// and we actually need to log this error as we are in an async routine; nobody is handling this error for now
-		swapLog.Error("error cashing cheque", "err", err)
-		return
-	}
-
-	metrics.GetOrRegisterCounter("swap.cheques.cashed.honey", nil).Inc(result.TotalPayout.Int64())
-
-	if result.Bounced {
-		metrics.GetOrRegisterCounter("swap.cheques.cashed.bounced", nil).Inc(1)
-		swapLog.Warn("cheque bounced", "tx", receipt.TxHash)
-		return
-		// TODO: do something here
-	}
-
-	swapLog.Debug("cash tx mined", "receipt", receipt)
 }
 
 // processAndVerifyCheque verifies the cheque and compares it with the last received cheque
@@ -588,6 +549,7 @@ func (s *Swap) saveBalance(p enode.ID, balance int64) error {
 
 // Close cleans up swap
 func (s *Swap) Close() error {
+	s.cashoutLoop.stop()
 	return s.store.Close()
 }
 

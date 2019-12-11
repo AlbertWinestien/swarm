@@ -40,6 +40,7 @@ var (
 type Backend interface {
 	bind.ContractBackend
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error)
+	TransactionByHash(ctx context.Context, txHash common.Hash) (*types.Transaction, bool, error)
 }
 
 // Contract interface defines the methods exported from the underlying go-bindings for the smart contract
@@ -48,8 +49,8 @@ type Contract interface {
 	Withdraw(auth *bind.TransactOpts, amount *big.Int) (*types.Receipt, error)
 	// Deposit sends a raw transaction to the chequebook, triggering the fallback—depositing amount
 	Deposit(auth *bind.TransactOpts, amout *big.Int) (*types.Receipt, error)
-	// CashChequeBeneficiary cashes the cheque by the beneficiary
-	CashChequeBeneficiary(auth *bind.TransactOpts, beneficiary common.Address, cumulativePayout *big.Int, ownerSig []byte) (*CashChequeResult, *types.Receipt, error)
+	CashChequeBeneficiaryStart(opts *bind.TransactOpts, beneficiary common.Address, cumulativePayout *big.Int, ownerSig []byte) (*types.Transaction, error)
+	CashChequeBeneficiaryResult(receipt *types.Receipt) *CashChequeResult
 	// LiquidBalance returns the LiquidBalance (total balance in ERC20-token - total hard deposits in ERC20-token) of the chequebook
 	LiquidBalance(auth *bind.CallOpts) (*big.Int, error)
 	//Token returns the address of the ERC20 contract, used by the chequebook
@@ -139,17 +140,15 @@ func (s simpleContract) Deposit(auth *bind.TransactOpts, amount *big.Int) (*type
 	return WaitFunc(auth.Context, s.backend, tx)
 }
 
-// CashChequeBeneficiary cashes the cheque on the blockchain and blocks until the transaction is mined.
-func (s simpleContract) CashChequeBeneficiary(opts *bind.TransactOpts, beneficiary common.Address, cumulativePayout *big.Int, ownerSig []byte) (*CashChequeResult, *types.Receipt, error) {
+func (s simpleContract) CashChequeBeneficiaryStart(opts *bind.TransactOpts, beneficiary common.Address, cumulativePayout *big.Int, ownerSig []byte) (*types.Transaction, error) {
 	tx, err := s.instance.CashChequeBeneficiary(opts, beneficiary, cumulativePayout, ownerSig)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	receipt, err := WaitFunc(opts.Context, s.backend, tx)
-	if err != nil {
-		return nil, nil, err
-	}
+	return tx, nil
+}
 
+func (s simpleContract) CashChequeBeneficiaryResult(receipt *types.Receipt) *CashChequeResult {
 	result := &CashChequeResult{
 		Bounced: false,
 	}
@@ -170,7 +169,7 @@ func (s simpleContract) CashChequeBeneficiary(opts *bind.TransactOpts, beneficia
 		}
 	}
 
-	return result, receipt, nil
+	return result
 }
 
 // LiquidBalance returns the LiquidBalance (total balance in ERC20-token - total hard deposits in ERC20-token) of the chequebook
